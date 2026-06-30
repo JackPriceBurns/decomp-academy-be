@@ -1,0 +1,7 @@
+/target
+
+# Fetched at build time by scripts/fetch-toolchain.sh — never committed.
+# Proprietary MWCC GC/2.0 compiler (must not be redistributed) + GPL objdump.
+# Only MIT-licensed wibo (vendor/toolchain/wibo) is committed.
+/vendor/compiler/
+/vendor/toolchain/binutils/

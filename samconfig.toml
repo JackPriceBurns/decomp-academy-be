@@ -1,0 +1,10 @@
+version = 0.1
+
+[default.global.parameters]
+stack_name = "decomp-academy-api"
+
+[default.deploy.parameters]
+stack_name = "decomp-academy-api"
+region = "eu-west-1"
+capabilities = "CAPABILITY_IAM"
+resolve_s3 = true

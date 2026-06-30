@@ -1,0 +1,1604 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Decomp Academy API. A fully serverless stack behind the custom domain: the
+  MWCC GC/2.0 compile service (x86_64 Lambda running wibo) and the auth + user-data
+  API (Cognito, HTTP API, Lambda, DynamoDB), all on one HTTP API. The frontend
+  reaches the compiler via the original flat routes and the versioned
+  /compile/mwcc/{version}/{action} routes.
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: api.decomp-academy.dev
+    Description: Custom domain for the HTTP API.
+  CertificateArn:
+    Type: String
+    Description: >
+      ACM cert ARN for DomainName (created + DNS-validated manually, regional
+      eu-west-1). Supplied at deploy time via the CERTIFICATE_ARN secret — not
+      committed, since the ARN embeds the AWS account id.
+  HostedZoneId:
+    Type: String
+    Description: >
+      Route53 hosted zone id for decomp-academy.dev (SAM adds the alias record).
+      Supplied at deploy time via the HOSTED_ZONE_ID secret — not committed.
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Default: https://decomp-academy.dev,http://localhost:3000
+    Description: Origins permitted by the HTTP API CORS config.
+  FromEmail:
+    Type: String
+    Default: noreply@decomp-academy.dev
+    Description: From address for transactional email (must be on a Resend-verified domain).
+  ResendApiKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: Resend API key (re_…). Required for transactional email — if empty, the custom email sender errors (sign-up / password reset fail).
+  FeedbackNotifyEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Where learner feedback notifications are emailed (via Resend). Supplied at
+      deploy time via the FEEDBACK_NOTIFY_EMAIL secret — not committed. Empty
+      disables the email.
+
+Globals:
+  Function:
+    Timeout: 10
+    MemorySize: 256
+    # Runtime + Architectures are per-function, not here: list props merge
+    # additively in Globals rather than override. All Rust on provided.al2023,
+    # static musl via each function's Makefile.
+
+Resources:
+  # ─── Auth + user-data API (serverless) ─────────────────────────────────────
+
+  # KMS key Cognito uses to encrypt verification codes for the email-sender Lambda
+  # (which decrypts them via the AWS Encryption SDK).
+  CognitoEmailSenderKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Encrypts Cognito verification codes for the Custom Email Sender Lambda.
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAccountAdmin
+            Effect: Allow
+            Principal: { AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root" }
+            Action: kms:*
+            Resource: "*"
+          - Sid: AllowCognitoEncrypt
+            Effect: Allow
+            Principal: { Service: cognito-idp.amazonaws.com }
+            Action: [kms:Encrypt, kms:GenerateDataKey*, kms:CreateGrant, kms:DescribeKey]
+            Resource: "*"
+
+  CognitoEmailSenderFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: api/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - arm64
+      Timeout: 15
+      MemorySize: 512
+      Environment:
+        Variables:
+          KMS_KEY_ARN: !GetAtt CognitoEmailSenderKey.Arn
+          FROM_EMAIL: !Ref FromEmail
+          FROM_NAME: Decomp Academy
+          RESEND_API_KEY: !Ref ResendApiKey
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: kms:Decrypt
+              Resource: !GetAtt CognitoEmailSenderKey.Arn
+
+  CognitoEmailSenderInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CognitoEmailSenderFunction.Arn
+      Principal: cognito-idp.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    # Losing this means losing every account — never replace, never delete.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    DependsOn: CognitoEmailSenderInvokePermission
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      LambdaConfig:
+        KMSKeyID: !GetAtt CognitoEmailSenderKey.Arn
+        CustomEmailSender:
+          LambdaArn: !GetAtt CognitoEmailSenderFunction.Arn
+          LambdaVersion: V1_0
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireUppercase: true
+          RequireSymbols: false
+      Schema:
+        - { Name: email, AttributeDataType: String, Required: true, Mutable: false }
+        - { Name: name, AttributeDataType: String, Required: false, Mutable: true }
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - { Name: verified_email, Priority: 1 }
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${AWS::StackName}-web"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      ReadAttributes: [email, email_verified, name]
+      WriteAttributes: [email, name]
+
+  DataTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-data"
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      AttributeDefinitions:
+        - { AttributeName: PK, AttributeType: S }
+        - { AttributeName: SK, AttributeType: S }
+      KeySchema:
+        - { AttributeName: PK, KeyType: HASH }
+        - { AttributeName: SK, KeyType: RANGE }
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Domain:
+        DomainName: !Ref DomainName
+        CertificateArn: !Ref CertificateArn
+        Route53:
+          HostedZoneId: !Ref HostedZoneId
+      CorsConfiguration:
+        AllowOrigins: !Ref AllowedOrigins
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, PUT, POST, DELETE, OPTIONS]
+      # Throttle the public, unauthenticated write routes (route throttling is
+      # global, not per-IP, so values have headroom over real concurrent use).
+      RouteSettings:
+        # /feedback writes a row + emails the owner — throttle to bound spam.
+        "POST /feedback":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 3
+        # /compile is the public playground compile (no lesson gate); throttle to
+        # bound compile-Lambda cost/abuse. The flat route + every version's
+        # versioned playground route (one per Lambda) get the same limits; the
+        # per-version entries mirror compiler/compilers.list (one per Lambda).
+        "POST /compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/247_92/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/233_144/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/233_159/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/233_159p1/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/233_163/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/233_163n/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/242_53/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/242_81/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/242_81r/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/247_92p1/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/247_105/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/247_107/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/247_108/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/41_51213/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/41_60126/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/41_60209/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/41_60831/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/42_127/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/42_140/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/42_142/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/42_60308/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/42_60422/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/43_145/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/43_151/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/43_172/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/43_188/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/43_202/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        "POST /compile/mwcc/43_213/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        # /stats/{lessonId} is public so anonymous learners' compiles still count;
+        # throttle + the UUID lessonId check (handler) bound table growth/cost.
+        "POST /stats/{lessonId}":
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience: [!Ref UserPoolClient]
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: api/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref DataTable
+          # Feedback notifications reuse the same Resend setup as the email sender.
+          FROM_EMAIL: !Ref FromEmail
+          FROM_NAME: Decomp Academy
+          RESEND_API_KEY: !Ref ResendApiKey
+          FEEDBACK_NOTIFY_EMAIL: !Ref FeedbackNotifyEmail
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DataTable
+      Events:
+        Me:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /me
+            Method: GET
+        GetProgress:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /progress
+            Method: GET
+        GetStats:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /stats
+            Method: GET
+        RecordCompile:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /stats/{lessonId}
+            Method: POST
+            # Anonymous learners compile too, so this counter is unauthenticated.
+            Auth: { Authorizer: NONE }
+        PutProgress:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /progress/{lessonId}
+            Method: PUT
+        SubmitFeedback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /feedback
+            Method: POST
+            # Anonymous learners submit feedback too, so this is unauthenticated.
+            Auth: { Authorizer: NONE }
+        GetFeedback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /feedback
+            Method: GET
+        DeleteFeedback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /feedback/{id}
+            Method: DELETE
+
+  # ─── Compile service on Lambda (x86_64) ────────────────────────────────────
+  # Rust on provided.al2023 (static musl; see compiler/Makefile). The toolchain
+  # ships in the package and runs in place from $LAMBDA_TASK_ROOT. Public
+  # (Authorizer: NONE). x86_64 because the MWCC toolchain is 32-bit x86.
+  #
+  # ── Egress-isolated network for the compile sandbox ─────────────────────────
+  # Dedicated VPC, private subnets, no internet/NAT route: the compiler runs
+  # untrusted code, so it can't connect out even if exploited. No NAT or VPC
+  # endpoints needed (the function makes no AWS API calls).
+  CompileVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.210.0.0/16
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-compile-vpc" }
+
+  CompileSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CompileVpc
+      CidrBlock: 10.210.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+
+  CompileSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref CompileVpc
+      CidrBlock: 10.210.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+
+  # Route table with only the implicit local route — no 0.0.0.0/0, so no egress.
+  CompilePrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref CompileVpc
+
+  CompileSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref CompileSubnetA
+      RouteTableId: !Ref CompilePrivateRouteTable
+
+  CompileSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref CompileSubnetB
+      RouteTableId: !Ref CompilePrivateRouteTable
+
+  # No-egress SG (belt-and-suspenders; no NAT/IGW route exists anyway).
+  CompileNoEgressSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: No egress for the untrusted-code compile sandbox
+      VpcId: !Ref CompileVpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 127.0.0.1/32
+          Description: deny all egress (no internet route exists regardless)
+
+  # ─── Compile Lambdas — one per MWCC version, in version order ───────────────
+  # Each runs the SAME bootstrap + vendored set; its MWCC_VERSION env var selects
+  # which mwcceppc.exe it runs (and gives it per-version AWS metrics). Routes:
+  # /compile/mwcc/<token>/<action>. CompileFunction (GC 2.0) also owns the legacy
+  # flat routes. Keep this list in sync with compiler/compilers.list.
+
+  # GC MW 1.0 (2.3.3 build 144)
+  CompileFnMwcc233144:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_233_144
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_144/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_144/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_144/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_144/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 1.1 (2.3.3 build 159)
+  CompileFnMwcc233159:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_233_159
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_159/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_159/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_159/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_159/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 1.1 patched (2.3.3 build 159)
+  CompileFnMwcc233159p1:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_233_159p1
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_159p1/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_159p1/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_159p1/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_159p1/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 1.2.5 (2.3.3 build 163)
+  CompileFnMwcc233163:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_233_163
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_163/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_163/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_163/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_163/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 1.2.5n (2.3.3 build 163)
+  CompileFnMwcc233163n:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_233_163n
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_163n/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_163n/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_163n/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/233_163n/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 1.3 (2.4.2 build 53)
+  CompileFnMwcc24253:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_242_53
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/242_53/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/242_53/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/242_53/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/242_53/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 1.3.2 (2.4.2 build 81)
+  CompileFnMwcc24281:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_242_81
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/242_81/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/242_81/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/242_81/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/242_81/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 1.3.2 patched (2.4.2 build 81)
+  CompileFnMwcc24281r:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_242_81r
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/242_81r/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/242_81r/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/242_81r/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/242_81r/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 2.0 (2.4.7 build 92) — default; also owns the legacy flat routes
+  CompileFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      # 2048 MB: headroom for warm-container RSS growth (recycle before an OOM kill
+      # skips CleanupGuard mid-compile); Lambda also scales CPU with memory.
+      MemorySize: 2048
+      # 2048 MB /tmp for per-compile scratch dirs (compiler/src/compile.rs):
+      # leftovers from hard-killed invocations fill the 512 MB default until writes
+      # fail with ENOSPC.
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_247_92
+      # Pin to the no-egress VPC defined above: runs untrusted source, so even an
+      # RCE can't call out. VpcConfig needs ENI perms, hence the VPC-access policy.
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /check, Method: POST, Auth: { Authorizer: NONE } }
+        # Free-form playground compile (no lesson/symbol). Public, throttled above.
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile, Method: POST, Auth: { Authorizer: NONE } }
+        # GC/2.0's versioned routes (token 247_92). The flat routes above stay live
+        # so the current frontend keeps working; the frontend migrates per-lesson.
+        VersionedHealth:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_92/health, Method: GET, Auth: { Authorizer: NONE } }
+        VersionedTarget:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_92/target, Method: POST, Auth: { Authorizer: NONE } }
+        VersionedCheck:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_92/check, Method: POST, Auth: { Authorizer: NONE } }
+        VersionedCompile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_92/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 2.0 patched (2.4.7 build 92)
+  CompileFnMwcc24792p1:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_247_92p1
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_92p1/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_92p1/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_92p1/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_92p1/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 2.5 (2.4.7 build 105)
+  CompileFnMwcc247105:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_247_105
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_105/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_105/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_105/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_105/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 2.6 (2.4.7 build 107)
+  CompileFnMwcc247107:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_247_107
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_107/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_107/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_107/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_107/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 2.7 (2.4.7 build 108)
+  CompileFnMwcc247108:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_247_108
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_108/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_108/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_108/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/247_108/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 3.0a3 (4.1 build 51213)
+  CompileFnMwcc4151213:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_41_51213
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_51213/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_51213/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_51213/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_51213/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 3.0a3.2 (4.1 build 60126)
+  CompileFnMwcc4160126:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_41_60126
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_60126/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_60126/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_60126/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_60126/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 3.0a3.3 (4.1 build 60209)
+  CompileFnMwcc4160209:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_41_60209
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_60209/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_60209/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_60209/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_60209/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 3.0 (4.1 build 60831)
+  CompileFnMwcc4160831:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_41_60831
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_60831/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_60831/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_60831/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/41_60831/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # Wii MW 1.0 patched mkw (4.2 build 142)
+  CompileFnMwcc42127:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_42_127
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_127/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_127/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_127/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_127/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # Wii MW 1.0RC1 (4.2 build 140)
+  CompileFnMwcc42140:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_42_140
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_140/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_140/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_140/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_140/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # Wii MW 1.0a (4.2 build 142)
+  CompileFnMwcc42142:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_42_142
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_142/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_142/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_142/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_142/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 3.0a3.4 (4.2 build 60308)
+  CompileFnMwcc4260308:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_42_60308
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_60308/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_60308/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_60308/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_60308/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # GC MW 3.0a5 (4.2 build 60422)
+  CompileFnMwcc4260422:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_42_60422
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_60422/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_60422/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_60422/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/42_60422/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # Wii MW 1.0 (4.3 build 145)
+  CompileFnMwcc43145:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_43_145
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_145/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_145/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_145/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_145/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # Wii MW 1.1 (4.3 build 151)
+  CompileFnMwcc43151:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_43_151
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_151/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_151/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_151/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_151/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # Wii MW 1.3 (4.3 build 172)
+  CompileFnMwcc43172:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_43_172
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_172/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_172/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_172/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_172/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # Wii MW 1.5 (4.3 build 188)
+  CompileFnMwcc43188:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_43_188
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_188/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_188/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_188/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_188/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # Wii MW 1.6 (4.3 build 202)
+  CompileFnMwcc43202:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_43_202
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_202/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_202/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_202/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_202/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+  # Wii MW 1.7 (4.3 build 213)
+  CompileFnMwcc43213:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          MWCC_VERSION: mwcc_43_213
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_213/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_213/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_213/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_213/compile, Method: POST, Auth: { Authorizer: NONE } }
+
+Outputs:
+  ApiUrl:
+    Description: Public base URL of the serverless API.
+    Value: !Sub "https://${DomainName}"
+  CompileApiUrl:
+    Description: >
+      MWCC compile service on Lambda, behind the custom domain: flat /health,
+      /target, /check, /compile and versioned /compile/mwcc/{version}/{action}.
+    Value: !Sub "https://${DomainName}"
+  HttpApiEndpoint:
+    Description: Raw execute-api endpoint (before the custom domain).
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  Region:
+    Value: !Ref AWS::Region

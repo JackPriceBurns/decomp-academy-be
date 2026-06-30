@@ -1,0 +1,117 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-west-1
+  STACK: decomp-academy-api
+  # A stable target dir (outside SAM's per-build .aws-sam/build scratch) so the
+  # compiled-dependency cache survives across runs; the Makefiles read it.
+  CARGO_TARGET_DIR: ${{ github.workspace }}/.cargo-target
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: "3"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The big win: persist compiled deps + the toolchain downloads across runs.
+      # Cold runs recompile every crate (incl. aws-lc-sys); a warm cache rebuilds
+      # only what changed. Keyed on the lockfiles, with a prefix fallback so a dep
+      # bump still restores most of the previous build.
+      - name: Cache Rust deps, target, and toolchains
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            ~/.cargo/bin/cargo-lambda
+            ~/.rustup/toolchains
+            ~/zig-linux-x86_64-0.13.0
+            ${{ github.workspace }}/.cargo-target
+          key: rust-deploy-${{ runner.os }}-${{ hashFiles('compiler/Cargo.lock', 'api/Cargo.lock') }}
+          restore-keys: |
+            rust-deploy-${{ runner.os }}-
+
+      # The compile service fetches MWCC + objdump into compiler/vendor/ at build
+      # time (scripts/fetch-toolchain.sh, run by sam build). Cache them so the
+      # ~77 MB compilers bundle isn't re-downloaded every deploy; the key is the
+      # script itself, so a pinned-version bump busts the cache. On a hit the
+      # fetch is a no-op (it verifies the SHA-1s and skips).
+      - name: Cache fetched compile toolchain (MWCC + objdump)
+        uses: actions/cache@v4
+        with:
+          path: |
+            compiler/vendor/compiler
+            compiler/vendor/toolchain/binutils
+          key: compile-toolchain-${{ hashFiles('compiler/scripts/fetch-toolchain.sh') }}
+
+      # All Lambdas are Rust. The compile service is x86_64/static-musl (musl-tools
+      # provides musl-gcc); the api + email-sender are arm64, cross-compiled by
+      # cargo-lambda + zig (which also handle aws-lc-sys's C). zig + cargo-lambda
+      # are skipped when restored from cache.
+      - name: Install Rust + build toolchains
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-gnu
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          if [ ! -x "$HOME/.cargo/bin/cargo-lambda" ]; then
+            curl -fsSL https://github.com/cargo-lambda/cargo-lambda/releases/download/v1.9.1/cargo-lambda-v1.9.1.x86_64-unknown-linux-musl.tar.gz \
+              | tar xz -C "$HOME/.cargo/bin"
+          fi
+          if [ ! -d "$HOME/zig-linux-x86_64-0.13.0" ]; then
+            curl -fsSL https://ziglang.org/download/0.13.0/zig-linux-x86_64-0.13.0.tar.xz | tar xJ -C "$HOME"
+          fi
+          echo "$HOME/zig-linux-x86_64-0.13.0" >> "$GITHUB_PATH"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # Builds all three Rust Lambdas to static musl binaries via their Makefiles.
+      # The compile service's Makefile first runs scripts/fetch-toolchain.sh to
+      # pull MWCC + objdump into vendor/ (no-op on a warm toolchain cache), then
+      # stages them next to committed wibo. sam deploy ships all of it.
+      - run: sam build
+
+      - name: Deploy
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          CERTIFICATE_ARN: ${{ secrets.CERTIFICATE_ARN }}
+          HOSTED_ZONE_ID: ${{ secrets.HOSTED_ZONE_ID }}
+          FEEDBACK_NOTIFY_EMAIL: ${{ secrets.FEEDBACK_NOTIFY_EMAIL }}
+        run: |
+          set -euo pipefail
+          sam deploy \
+            --stack-name "$STACK" --region "$AWS_REGION" \
+            --capabilities CAPABILITY_IAM \
+            --resolve-s3 --no-confirm-changeset --no-fail-on-empty-changeset \
+            --parameter-overrides \
+              "ResendApiKey=${RESEND_API_KEY:-}" \
+              "CertificateArn=${CERTIFICATE_ARN:?CERTIFICATE_ARN secret is required}" \
+              "HostedZoneId=${HOSTED_ZONE_ID:?HOSTED_ZONE_ID secret is required}" \
+              "FeedbackNotifyEmail=${FEEDBACK_NOTIFY_EMAIL:-}"
+
+          echo
+          echo "==> Outputs:"
+          aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query "Stacks[0].Outputs" --output table

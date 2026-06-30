@@ -1,0 +1,9 @@
+.aws-sam/
+node_modules/
+*.log
+.DS_Store
+samconfig.local.toml
+
+# IDE / editor
+.idea/
+.vscode/

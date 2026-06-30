@@ -1,0 +1,53 @@
+# MWCC compiler registry. Read by:
+#   * build.rs                   -> generates the in-binary Rust registry
+#   * scripts/fetch-toolchain.sh -> fetches + SHA-verifies each mwcceppc.exe
+#
+# One Lambda is deployed per row (for per-version AWS metrics), all running the
+# SAME shared bootstrap; the row's `id` is passed as the MWCC_VERSION env var to
+# select which vendored mwcceppc.exe that Lambda runs. Those per-version Lambdas
+# live in template.yaml (hand-maintained — keep them in sync with this list, one
+# Lambda per row, in the same order).
+#
+# Columns are pipe-delimited:  id|family|dir|token|sha1|label
+#   id     decomp.me compiler id; the MWCC_VERSION env value for that Lambda
+#   family bundle top-level dir (GC | Wii); also the vendor/ subdir
+#   dir    bundle version dir; vendored at vendor/compiler/<family>/<dir>/
+#   token  URL version segment -> /compile/mwcc/<token>/<action> (unique, url-safe)
+#   sha1   SHA-1 of that version's mwcceppc.exe (build-time verification)
+#   label  human label for /health
+#
+# Source: decomp.dev compilers bundle (see COMPILERS_TAG in fetch-toolchain.sh).
+# The license DLL (lmgr326b.dll for GC, lmgr8c.dll for Wii/3.0a) is one shared
+# file across every version, pinned once in fetch-toolchain.sh — not listed here.
+#
+# Default version (owns the legacy flat routes): mwcc_247_92 (GC MW 2.0).
+# Not in this bundle tag: GC MW 1.2.5e (mwcc_233_163e). ProDG is a separate gcc
+# toolchain (multi-exe pipeline), not wired here.
+mwcc_233_144|GC|1.0|233_144|1880894d2706abeabd467f84048767c5f89c44c1|GC MW 1.0 (2.3.3 build 144)
+mwcc_233_159|GC|1.1|233_159|c662dc222d90ee9546823934b0816c0366a08856|GC MW 1.1 (2.3.3 build 159)
+mwcc_233_159p1|GC|1.1p1|233_159p1|73dc1588d7fbbcfed019e16a2ce3968d10cc53a2|GC MW 1.1 patched (2.3.3 build 159)
+mwcc_233_163|GC|1.2.5|233_163|03187e49c58ce9c1bcbfe3691bbd0fb92fbe7909|GC MW 1.2.5 (2.3.3 build 163)
+mwcc_233_163n|GC|1.2.5n|233_163n|ef0480e9b4a42398bda3e412794c6628e26e1bf7|GC MW 1.2.5n (2.3.3 build 163)
+mwcc_242_53|GC|1.3|242_53|b18d7887262e6b591c146c9dc4f58a4be7c0e939|GC MW 1.3 (2.4.2 build 53)
+mwcc_242_81|GC|1.3.2|242_81|d8f9c36d62f66c2a044d5a20a132b79eeb2f36e5|GC MW 1.3.2 (2.4.2 build 81)
+mwcc_242_81r|GC|1.3.2r|242_81r|7acceb12b91f1c969e8decf8c1076ce9b3dfaa01|GC MW 1.3.2 patched (2.4.2 build 81)
+mwcc_247_92|GC|2.0|247_92|ef148743ee72be15f64926ac18c3aadc9cca2b47|GC MW 2.0 (2.4.7 build 92)
+mwcc_247_92p1|GC|2.0p1|247_92p1|74bc177b10d1bbe8a60a21a6c0aa86d2dd9c0668|GC MW 2.0 patched (2.4.7 build 92)
+mwcc_247_105|GC|2.5|247_105|539c0b31d51510cd076755bc64c0c39c3d0f364e|GC MW 2.5 (2.4.7 build 105)
+mwcc_247_107|GC|2.6|247_107|1110a7a9924a09a608967efdf79ecf09900344e7|GC MW 2.6 (2.4.7 build 107)
+mwcc_247_108|GC|2.7|247_108|100dd3a2898a1ece55462801d42ff5de8b42e29f|GC MW 2.7 (2.4.7 build 108)
+mwcc_41_51213|GC|3.0a3|41_51213|14c602150975d7e9460931077a8528b035604dba|GC MW 3.0a3 (4.1 build 51213)
+mwcc_41_60126|GC|3.0a3.2|41_60126|46cc62c8b1564e65f53c9185b7ea1c361611d832|GC MW 3.0a3.2 (4.1 build 60126)
+mwcc_41_60209|GC|3.0a3.3|41_60209|96e6419b5dcf7d074796bc0753039ecd851a083a|GC MW 3.0a3.3 (4.1 build 60209)
+mwcc_41_60831|GC|3.0a5.2|41_60831|79683505e7fc6bb63e5c169f21623df272dd2262|GC MW 3.0 (4.1 build 60831)
+mwcc_42_127|Wii|0x4201_127|42_127|d72ee390287ee8418f1ef664703f6ab5cbf8d0f8|Wii MW 1.0 patched mkw (4.2 build 142)
+mwcc_42_140|Wii|1.0RC1|42_140|b09e8745e90b88b793cd580576aa1fd11cbdd9ac|Wii MW 1.0RC1 (4.2 build 140)
+mwcc_42_142|Wii|1.0a|42_142|fb0820a3f519b4e7c03a2b7a3e810007ff3c5c81|Wii MW 1.0a (4.2 build 142)
+mwcc_42_60308|GC|3.0a3.4|42_60308|c2c463a3dd7d2a74d3e98096cd9ef93c8c42cbcf|GC MW 3.0a3.4 (4.2 build 60308)
+mwcc_42_60422|GC|3.0a5|42_60422|a887d5a64ee36c9c667ec17f186f588387ea9638|GC MW 3.0a5 (4.2 build 60422)
+mwcc_43_145|Wii|1.0|43_145|0c3f0b23a0deac4c48b123e558e690bea167fa17|Wii MW 1.0 (4.3 build 145)
+mwcc_43_151|Wii|1.1|43_151|c3e44c9064a9c4ef31ec8ead7e2b2112dc4aa27d|Wii MW 1.1 (4.3 build 151)
+mwcc_43_172|Wii|1.3|43_172|310620c3b00fd05b9e3010e5af498f0bbd688583|Wii MW 1.3 (4.3 build 172)
+mwcc_43_188|Wii|1.5|43_188|68bbe26fda3c1bddbd19496d3575c8bc24c07d79|Wii MW 1.5 (4.3 build 188)
+mwcc_43_202|Wii|1.6|43_202|46c0a12dbcffced961e5a5566b7f7baa7bf12091|Wii MW 1.6 (4.3 build 202)
+mwcc_43_213|Wii|1.7|43_213|cc38fa035e0222ec8fa3389a5464cbd8ac3995fb|Wii MW 1.7 (4.3 build 213)

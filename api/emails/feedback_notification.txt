@@ -1,0 +1,22 @@
+Decomp Academy
+
+
+NEW FEEDBACK
+
+Sentiment __SENTIMENT__
+
+Lesson __LESSON__
+
+From __EMAIL__
+
+Source __SOURCE__
+
+Received __TIME__
+
+Message
+
+__MESSAGE__
+
+----------------------------------------
+
+Sent automatically by Decomp Academy — manage every submission in the admin dashboard.

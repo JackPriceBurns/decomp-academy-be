@@ -1,0 +1,24 @@
+{
+  "name": "decomp-academy-emails",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Email-authoring tooling for Decomp Academy. The Lambdas are Rust (api/, compiler/); these react-email templates are the design source, pre-rendered to static HTML for the Rust email-sender via `npm run emails:export`.",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "email": "email dev --dir src/emails --port 3001",
+    "emails:export": "node scripts/export-emails.mjs"
+  },
+  "dependencies": {
+    "@react-email/components": "^0.0.32",
+    "@react-email/render": "^1.0.3",
+    "esbuild": "^0.24.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "@types/react": "^18.3.12",
+    "react-email": "^3.0.4",
+    "typescript": "^5.6.3"
+  }
+}
