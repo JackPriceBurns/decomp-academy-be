@@ -8,6 +8,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { VerificationEmail } from "../src/emails/VerificationEmail";
 import { PasswordResetEmail } from "../src/emails/PasswordResetEmail";
 import { FeedbackNotificationEmail } from "../src/emails/FeedbackNotificationEmail";
+import { FeedbackReplyEmail } from "../src/emails/FeedbackReplyEmail";
 
 const CODE = "__OTP_CODE__";
 const OUT = "api/emails";
@@ -19,6 +20,8 @@ const targets = [
   // Owner notification — its dynamic fields are __…__ placeholders the Rust api
   // Lambda substitutes at send time (no OTP code).
   ["feedback_notification", createElement(FeedbackNotificationEmail)],
+  // Learner-facing reply — same __…__ placeholder substitution by the api Lambda.
+  ["feedback_reply", createElement(FeedbackReplyEmail)],
 ] as const;
 
 async function main() {

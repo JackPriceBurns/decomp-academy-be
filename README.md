@@ -142,6 +142,14 @@ Email bodies are authored as [react-email](https://react.email) templates in
 `include_str!`s those and substitutes the code at runtime — **React is never in
 the runtime path.**
 
+The `ApiFunction` sends two further emails through the same Resend setup, both
+with `__…__` placeholders substituted at send time: a **feedback notification**
+to the site owner (`FEEDBACK_NOTIFY_EMAIL`) on every submission, and a **feedback
+reply** to the learner when an admin answers via `POST /feedback/{id}/reply` —
+only ever sent to learners who left an email. Unlike the OTP path, the owner
+notification is best-effort (a missing key just skips it), while the admin reply
+surfaces a send failure so it can be retried.
+
 Transactional email **requires Resend to be configured**: if `RESEND_API_KEY` is
 unset, the email-sender trigger errors (failing the Cognito sign-up / reset)
 rather than delivering — it never logs the plaintext code. Set it up before

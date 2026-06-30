@@ -244,6 +244,12 @@ pub struct FeedbackItem {
     pub source: Option<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    // Set once an admin has emailed the learner back. `replied_at` drives the
+    // "Replied" state in the admin view; `reply_message` is the latest reply sent.
+    #[serde(rename = "repliedAt", skip_serializing_if = "Option::is_none")]
+    pub replied_at: Option<String>,
+    #[serde(rename = "replyMessage", skip_serializing_if = "Option::is_none")]
+    pub reply_message: Option<String>,
 }
 
 pub async fn put_feedback(db: &Client, input: FeedbackInput) -> Result<FeedbackItem, DynError> {
@@ -278,6 +284,8 @@ pub async fn put_feedback(db: &Client, input: FeedbackInput) -> Result<FeedbackI
         email: input.email,
         source: input.source,
         created_at,
+        replied_at: None,
+        reply_message: None,
     })
 }
 
@@ -304,6 +312,8 @@ pub async fn list_feedback(db: &Client) -> Result<Vec<FeedbackItem>, DynError> {
                 email: as_s(item, "email"),
                 source: as_s(item, "source"),
                 created_at: as_s(item, "createdAt").unwrap_or_default(),
+                replied_at: as_s(item, "repliedAt"),
+                reply_message: as_s(item, "replyMessage"),
             });
         }
         match res.last_evaluated_key() {
@@ -312,6 +322,52 @@ pub async fn list_feedback(db: &Client) -> Result<Vec<FeedbackItem>, DynError> {
         }
     }
     Ok(items)
+}
+
+// Fetch a single feedback row by its id (the SK). Returns None when the id
+// doesn't exist — the reply route maps that to a 404.
+pub async fn get_feedback(db: &Client, id: &str) -> Result<Option<FeedbackItem>, DynError> {
+    let res = db
+        .get_item()
+        .table_name(table_name())
+        .key("PK", AttributeValue::S(FEEDBACK_PK.into()))
+        .key("SK", AttributeValue::S(id.to_string()))
+        .send()
+        .await?;
+    let Some(item) = res.item else { return Ok(None) };
+    Ok(Some(FeedbackItem {
+        id: as_s(&item, "SK").unwrap_or_else(|| id.to_string()),
+        lesson_id: as_s(&item, "lessonId"),
+        lesson_title: as_s(&item, "lessonTitle"),
+        sentiment: as_s(&item, "sentiment"),
+        message: as_s(&item, "message"),
+        email: as_s(&item, "email"),
+        source: as_s(&item, "source"),
+        created_at: as_s(&item, "createdAt").unwrap_or_default(),
+        replied_at: as_s(&item, "repliedAt"),
+        reply_message: as_s(&item, "replyMessage"),
+    }))
+}
+
+// Record that the owner has emailed the learner back: stamp the reply time and
+// store the latest reply text. Only written after the email actually sends, so a
+// row is never marked replied for a message the learner didn't receive.
+pub async fn mark_feedback_replied(
+    db: &Client,
+    id: &str,
+    reply_message: &str,
+) -> Result<String, DynError> {
+    let replied_at = now_iso8601();
+    db.update_item()
+        .table_name(table_name())
+        .key("PK", AttributeValue::S(FEEDBACK_PK.into()))
+        .key("SK", AttributeValue::S(id.to_string()))
+        .update_expression("SET repliedAt = :at, replyMessage = :msg")
+        .expression_attribute_values(":at", AttributeValue::S(replied_at.clone()))
+        .expression_attribute_values(":msg", AttributeValue::S(reply_message.to_string()))
+        .send()
+        .await?;
+    Ok(replied_at)
 }
 
 pub async fn delete_feedback(db: &Client, id: &str) -> Result<(), DynError> {

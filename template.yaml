@@ -376,6 +376,12 @@ Resources:
             ApiId: !Ref HttpApi
             Path: /feedback/{id}
             Method: DELETE
+        ReplyFeedback:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /feedback/{id}/reply
+            Method: POST
 
   # ─── Compile service on Lambda (x86_64) ────────────────────────────────────
   # Rust on provided.al2023 (static musl; see compiler/Makefile). The toolchain

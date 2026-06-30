@@ -9,8 +9,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use decomp_academy_api::{
-    delete_feedback, dynamo, get_all_progress, get_compile_stats, list_feedback, put_feedback,
-    record_compile, upsert_progress, FeedbackInput, ProgressInput,
+    delete_feedback, dynamo, get_all_progress, get_compile_stats, get_feedback, list_feedback,
+    mark_feedback_replied, put_feedback, record_compile, upsert_progress, FeedbackInput,
+    ProgressInput,
 };
 
 // Shared across invocations: the Dynamo client plus a reqwest client reused for
@@ -48,6 +49,9 @@ fn not_found(message: &str) -> Result<Response<Body>, Error> {
 }
 fn forbidden(message: &str) -> Result<Response<Body>, Error> {
     resp(403, json!({ "error": { "message": message } }))
+}
+fn server_error(message: &str) -> Result<Response<Body>, Error> {
+    resp(502, json!({ "error": { "message": message } }))
 }
 
 fn route_key(req: &Request) -> String {
@@ -130,6 +134,11 @@ struct StatBody {
 }
 
 #[derive(Deserialize, Default)]
+struct ReplyBody {
+    message: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
 struct FeedbackBody {
     #[serde(rename = "lessonId")]
     lesson_id: Option<String>,
@@ -197,6 +206,17 @@ async fn handler(req: Request, state: &AppState) -> Result<Response<Body>, Error
             };
             delete_feedback(db, &id).await?;
             ok(json!({ "deleted": true }))
+        }
+
+        // Admin emails the learner back (only possible when they left an address).
+        "POST /feedback/{id}/reply" => {
+            if !is_admin(&req) {
+                return forbidden("Admin access required");
+            }
+            let Some(id) = path_param(&req, "id") else {
+                return bad_request("Missing feedback id");
+            };
+            reply_feedback(&req, state, &id).await
         }
 
         "PUT /progress/{lessonId}" => {
@@ -366,6 +386,97 @@ async fn notify_owner(http: &reqwest::Client, fb: &decomp_academy_api::FeedbackI
         Ok(r) => eprintln!("Resend feedback email failed ({})", r.status()),
         Err(e) => eprintln!("Resend feedback email error: {e}"),
     }
+}
+
+// ── Feedback reply (admin) ──────────────────────────────────────────────────
+
+const MAX_REPLY: usize = 4000;
+
+const REPLY_HTML: &str = include_str!("../../emails/feedback_reply.html");
+const REPLY_TEXT: &str = include_str!("../../emails/feedback_reply.txt");
+
+// Admin-authored reply that emails the learner. Unlike the owner notification
+// (best-effort), the admin is actively sending, so a missing/failed Resend send
+// is surfaced as an error and the row is left un-replied — the admin can retry.
+async fn reply_feedback(req: &Request, state: &AppState, id: &str) -> Result<Response<Body>, Error> {
+    let parsed: ReplyBody = match serde_json::from_slice(&body_bytes(req)) {
+        Ok(p) => p,
+        Err(_) if body_bytes(req).is_empty() => ReplyBody::default(),
+        Err(_) => return bad_request("Body must be JSON"),
+    };
+    let Some(message) = trimmed(parsed.message, MAX_REPLY) else {
+        return bad_request("Reply message is required");
+    };
+
+    let Some(fb) = get_feedback(&state.db, id).await? else {
+        return not_found("Feedback not found");
+    };
+    let Some(to) = fb.email.clone() else {
+        return bad_request("This feedback has no email address to reply to");
+    };
+
+    if let Err(e) = send_reply(&state.http, &fb, &to, &message).await {
+        eprintln!("Feedback reply send failed ({id}): {e}");
+        return server_error("Couldn't send the reply email. Please try again.");
+    }
+
+    let replied_at = mark_feedback_replied(&state.db, id, &message).await?;
+    println!("Feedback reply sent ({id})");
+    ok(json!({ "sent": true, "repliedAt": replied_at, "replyMessage": message }))
+}
+
+// Render and send the learner-facing reply via Resend. Returns Err on any
+// misconfiguration or non-2xx so the caller can surface it (and skip marking the
+// row replied). reply_to is the owner inbox, so the learner can write back.
+async fn send_reply(
+    http: &reqwest::Client,
+    fb: &decomp_academy_api::FeedbackItem,
+    to: &str,
+    reply: &str,
+) -> Result<(), Error> {
+    let api_key = match std::env::var("RESEND_API_KEY") {
+        Ok(k) if !k.is_empty() => k,
+        _ => return Err("RESEND_API_KEY is not configured".into()),
+    };
+    let from_email =
+        std::env::var("FROM_EMAIL").unwrap_or_else(|_| "noreply@decomp-academy.dev".into());
+    let from_name = std::env::var("FROM_NAME").unwrap_or_else(|_| "Decomp Academy".into());
+
+    let lesson =
+        fb.lesson_title.clone().or_else(|| fb.lesson_id.clone()).unwrap_or_else(|| "General".into());
+    let original = fb.message.clone().unwrap_or_else(|| "(no message)".into());
+
+    let html = REPLY_HTML
+        .replace("__LESSON__", &html_escape(&lesson))
+        .replace("__ORIGINAL__", &html_escape(&original).replace('\n', "<br>"))
+        .replace("__REPLY__", &html_escape(reply).replace('\n', "<br>"));
+    let text = REPLY_TEXT
+        .replace("__LESSON__", &lesson)
+        .replace("__ORIGINAL__", &original)
+        .replace("__REPLY__", reply);
+
+    let mut payload = json!({
+        "from": format!("{from_name} <{from_email}>"),
+        "to": to,
+        "subject": format!("Re: your feedback on {lesson}"),
+        "html": html,
+        "text": text,
+    });
+    // Replies from the learner reach the owner inbox when one is configured.
+    if let Ok(owner) = std::env::var("FEEDBACK_NOTIFY_EMAIL") {
+        if !owner.is_empty() {
+            payload["reply_to"] = json!(owner);
+        }
+    }
+
+    let res =
+        http.post("https://api.resend.com/emails").bearer_auth(api_key).json(&payload).send().await?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        return Err(format!("Resend reply failed ({status}): {body}").into());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
