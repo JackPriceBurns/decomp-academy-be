@@ -58,6 +58,130 @@ pub fn validate_opt(s: Option<&str>) -> String {
     }
 }
 
+// IDO opt presets: `O<level>[,g<debug>]`, comma style mirroring MWCC's `O4,p`.
+// The debug level is part of the preset because it changes IDO's -O2 *code*
+// (delay-slot packing, hazard nops), not just debug info. `O2,g3` is the
+// dinosaur-planet game-code default, so course targets match the real build.
+pub const IDO_ALLOWED_OPT: &[&str] = &["O0", "O1", "O1,g2", "O2,g0", "O2,g3", "O3"];
+pub const IDO_DEFAULT_OPT: &str = "O2,g3";
+
+/// Which compiler family a request runs: MWCC (PowerPC, under wibo) or IDO 5.3
+/// (MIPS, a native ELF). Selected by the URL route family — never by the request
+/// body. Each variant owns the seams that differ between the families: opt
+/// validation, the types preamble, the compile/objdump command lines, and
+/// diagnostics cleanup. Every `Mwcc` arm delegates to the original free
+/// functions, keeping that path byte-identical to the pre-IDO service.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Toolchain {
+    Mwcc,
+    Ido53,
+}
+
+impl Toolchain {
+    pub fn validate_opt(self, s: Option<&str>) -> String {
+        match self {
+            Toolchain::Mwcc => validate_opt(s),
+            Toolchain::Ido53 => match s.map(str::trim) {
+                Some(v) if IDO_ALLOWED_OPT.contains(&v) => v.to_string(),
+                _ => IDO_DEFAULT_OPT.to_string(),
+            },
+        }
+    }
+
+    fn types_preamble(self) -> &'static str {
+        match self {
+            Toolchain::Mwcc => TYPES_PREAMBLE,
+            Toolchain::Ido53 => TYPES_PREAMBLE_IDO,
+        }
+    }
+
+    /// Per-family scratch root under temp, so one family's stale sweep never
+    /// scans the other's live dirs.
+    fn scratch_root(self) -> &'static str {
+        match self {
+            Toolchain::Mwcc => "mwcc",
+            Toolchain::Ido53 => "ido",
+        }
+    }
+
+    /// Source file extension. IDO is C-only; its routes ignore the `language`
+    /// field (falling back like an unknown opt does) rather than erroring.
+    fn source_ext(self, language: Language) -> &'static str {
+        match self {
+            Toolchain::Mwcc => language.ext(),
+            Toolchain::Ido53 => "c",
+        }
+    }
+
+    /// (program, argv) for the compile step. MWCC runs under wibo with the exe
+    /// path as argv[0]; IDO's `cc` driver is invoked directly.
+    fn compile_cmd(self, req: &Request<'_>, c_file: &Path, o_file: &Path) -> (PathBuf, Vec<String>) {
+        match self {
+            Toolchain::Mwcc => {
+                let mut args: Vec<String> = vec![mwcc().to_string_lossy().into_owned()];
+                args.extend(base_flags(req.language, &req.opt, req.peephole, req.schedule));
+                args.extend(req.extra_flags.iter().cloned());
+                args.push("-c".into());
+                args.push(c_file.to_string_lossy().into_owned());
+                args.push("-o".into());
+                args.push(o_file.to_string_lossy().into_owned());
+                (wibo(), args)
+            }
+            Toolchain::Ido53 => {
+                let mut args = ido_base_flags(&req.opt);
+                args.push("-o".into());
+                args.push(o_file.to_string_lossy().into_owned());
+                args.push(c_file.to_string_lossy().into_owned());
+                (ido_cc(), args)
+            }
+        }
+    }
+
+    /// (program, argv) for the disassembly step.
+    fn objdump_cmd(self, o_file: &Path) -> (PathBuf, Vec<String>) {
+        match self {
+            Toolchain::Mwcc => {
+                (objdump(), ["-M", "gekko", "-drz", &o_file.to_string_lossy()].map(String::from).to_vec())
+            }
+            Toolchain::Ido53 => (
+                mips_objdump(),
+                ["-m", "mips:4300", "-drz", &o_file.to_string_lossy()].map(String::from).to_vec(),
+            ),
+        }
+    }
+
+    fn clean_diagnostics(self, text: &str, line_offset: i64) -> String {
+        match self {
+            Toolchain::Mwcc => clean_diagnostics(text, line_offset),
+            Toolchain::Ido53 => clean_ido_diagnostics(text, line_offset),
+        }
+    }
+}
+
+/// The dinosaur-planet game-code invocation (build.ninja's CC_FLAGS + OPT_FLAGS
+/// + MIPS_ISET), minus `-I include` and `-DF3DEX_GBI_2` — course code compiles
+/// against the injected preamble, never the game's include tree. IDO rejects
+/// `-O3` combined with `-Xfullwarn`, so that preset drops the warning flag
+/// (exactly what dinosaur-planet's configure.py does for its -O3 files).
+fn ido_base_flags(opt: &str) -> Vec<String> {
+    let mut f: Vec<String> =
+        ["-c", "-D_LANGUAGE_C", "-D_MIPS_SZLONG=32", "-G", "0", "-non_shared"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+    if !opt.starts_with("O3") {
+        f.push("-Xfullwarn".into());
+    }
+    for s in ["-Xcpluscomm", "-Wab,-r4300_mul", "-woff", "838,649,763"] {
+        f.push(s.to_string());
+    }
+    for part in opt.split(',') {
+        f.push(format!("-{part}"));
+    }
+    f.push("-mips2".into());
+    f
+}
+
 // One MWCC build. The registry (`COMPILERS`) is generated by build.rs from
 // compilers.list so the binary, the fetch script, and the template generator all
 // share one manifest. The same binary ships to every per-version Lambda; each
@@ -176,6 +300,42 @@ typedef int BOOL;\n\
 #define NULL 0\n\
 #endif\n";
 
+// IDO preamble — the include/PR/ultratypes.h spellings from dinosaur-planet
+// under -D_MIPS_SZLONG=32 (u32/s32 are unsigned long/long in that LP32 world),
+// plus the BOOL/TRUE/FALSE/NULL conveniences the MWCC preamble provides. Kept
+// separate from TYPES_PREAMBLE so the two families can't drift into each other.
+const TYPES_PREAMBLE_IDO: &str = "typedef signed char s8;\n\
+typedef unsigned char u8;\n\
+typedef signed short s16;\n\
+typedef unsigned short u16;\n\
+typedef signed long s32;\n\
+typedef unsigned long u32;\n\
+typedef signed long long s64;\n\
+typedef unsigned long long u64;\n\
+typedef volatile u8 vu8;\n\
+typedef volatile u16 vu16;\n\
+typedef volatile u32 vu32;\n\
+typedef volatile u64 vu64;\n\
+typedef volatile s8 vs8;\n\
+typedef volatile s16 vs16;\n\
+typedef volatile s32 vs32;\n\
+typedef volatile s64 vs64;\n\
+typedef float f32;\n\
+typedef double f64;\n\
+typedef volatile f32 vf32;\n\
+typedef volatile f64 vf64;\n\
+typedef int BOOL;\n\
+#define TRUE 1\n\
+#define FALSE 0\n\
+#ifndef NULL\n\
+#define NULL 0\n\
+#endif\n";
+
+/// Human label for the IDO Lambda's /health. IDO 5.3's `cc` has no version
+/// flag (`-version` is rejected as an unknown option), so health reports this
+/// static label instead of probing a banner.
+const IDO_LABEL: &str = "IDO 5.3 (MIPSpro C, decompals/ido-static-recomp v1.2)";
+
 const TIMEOUT: Duration = Duration::from_millis(25_000);
 
 fn vendor_base() -> PathBuf {
@@ -201,6 +361,21 @@ fn mwcc() -> PathBuf {
 }
 fn objdump() -> PathBuf {
     tool("OBJDUMP", "toolchain/binutils/powerpc-eabi-objdump")
+}
+/// IDO 5.3 `cc` driver — a native ELF that execs its sibling passes
+/// (cfe/uopt/ugen/as1) from its own directory, so the whole vendored 5.3/ dir
+/// ships together. `IDO_CC` overrides for local dev/selftest.
+fn ido_cc() -> PathBuf {
+    tool("IDO_CC", "ido/5.3/cc")
+}
+/// GNU objdump built for mips (decompals/binutils-mips-ps2-decompals release).
+/// Dynamically linked against libzstd.so.1, vendored beside it in lib/ — the
+/// objdump invocation sets LD_LIBRARY_PATH to `mips_objdump_lib_dir`.
+fn mips_objdump() -> PathBuf {
+    tool("MIPS_OBJDUMP", "toolchain/binutils-mips/mips-ps2-decompals-objdump")
+}
+fn mips_objdump_lib_dir() -> PathBuf {
+    vendor_base().join("toolchain/binutils-mips/lib")
 }
 
 #[derive(Serialize, Clone)]
@@ -229,12 +404,14 @@ pub struct Request<'a> {
     pub context: Option<&'a str>,
     pub symbol: &'a str,
     pub language: Language,
-    /// Validated opt preset (e.g. "O4,p"); see `validate_opt`.
+    /// Validated opt preset (e.g. "O4,p"); see `Toolchain::validate_opt`.
     pub opt: String,
     pub peephole: bool,
     pub schedule: bool,
     pub extra_flags: Vec<String>,
     pub with_types: bool,
+    /// Which compiler family runs this request (derived from the URL route).
+    pub toolchain: Toolchain,
 }
 
 enum RunErr {
@@ -242,11 +419,20 @@ enum RunErr {
     Spawn(std::io::Error),
 }
 
-async fn run_cmd(program: &Path, args: &[String], cwd: Option<&Path>, dur: Duration) -> Result<std::process::Output, RunErr> {
+async fn run_cmd(
+    program: &Path,
+    args: &[String],
+    cwd: Option<&Path>,
+    envs: &[(&str, String)],
+    dur: Duration,
+) -> Result<std::process::Output, RunErr> {
     let mut cmd = Command::new(program);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     if let Some(c) = cwd {
         cmd.current_dir(c);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
     }
     // Defense in depth: the toolchain (wibo/mwcc/objdump) never needs AWS
     // credentials, so strip them from the child's environment. That way, even if a
@@ -303,7 +489,7 @@ pub async fn compile(req: Request<'_>) -> Outcome {
 
     let mut preamble = String::new();
     if req.with_types {
-        preamble.push_str(TYPES_PREAMBLE);
+        preamble.push_str(req.toolchain.types_preamble());
     }
     if let Some(ctx) = req.context {
         preamble.push_str(ctx);
@@ -316,10 +502,10 @@ pub async fn compile(req: Request<'_>) -> Outcome {
     // wall / OOM) before their CleanupGuard could run. /tmp persists across
     // invocations on a warm container, so without this these leftovers pile up
     // until /tmp fills and this very write fails with ENOSPC.
-    let mwcc_root = std::env::temp_dir().join("mwcc");
-    sweep_stale_scratch(&mwcc_root);
-    let dir = mwcc_root.join(unique_id());
-    let c_file = dir.join(format!("u.{}", req.language.ext()));
+    let scratch_root = std::env::temp_dir().join(req.toolchain.scratch_root());
+    sweep_stale_scratch(&scratch_root);
+    let dir = scratch_root.join(unique_id());
+    let c_file = dir.join(format!("u.{}", req.toolchain.source_ext(req.language)));
     let o_file = dir.join("u.o");
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         return Outcome::fail(format!("Could not create work dir: {e}"), Vec::new());
@@ -330,15 +516,17 @@ pub async fn compile(req: Request<'_>) -> Outcome {
         return Outcome::fail(format!("Could not write source: {e}"), Vec::new());
     }
 
-    let mut args: Vec<String> = vec![mwcc().to_string_lossy().into_owned()];
-    args.extend(base_flags(req.language, &req.opt, req.peephole, req.schedule));
-    args.extend(req.extra_flags.iter().cloned());
-    args.push("-c".into());
-    args.push(c_file.to_string_lossy().into_owned());
-    args.push("-o".into());
-    args.push(o_file.to_string_lossy().into_owned());
+    let (cc_prog, cc_args) = req.toolchain.compile_cmd(&req, &c_file, &o_file);
+    // IDO's cc driver writes its own pass intermediates via $TMPDIR; point it at
+    // the per-compile dir so they're removed by CleanupGuard (verified: the
+    // driver honors TMPDIR and errors if it isn't writable). MWCC gets no extra
+    // env, keeping that path byte-identical.
+    let cc_envs: Vec<(&str, String)> = match req.toolchain {
+        Toolchain::Mwcc => Vec::new(),
+        Toolchain::Ido53 => vec![("TMPDIR", dir.to_string_lossy().into_owned())],
+    };
 
-    let (combined, status_ok) = match run_cmd(&wibo(), &args, Some(&dir), TIMEOUT).await {
+    let (combined, status_ok) = match run_cmd(&cc_prog, &cc_args, Some(&dir), &cc_envs, TIMEOUT).await {
         Err(RunErr::Timeout) => {
             return Outcome::fail(
                 "Compilation timed out (possible infinite loop in code generation).",
@@ -358,14 +546,20 @@ pub async fn compile(req: Request<'_>) -> Outcome {
 
     if !o_file.exists() {
         if !status_ok {
-            let diag = clean_diagnostics(&combined, line_offset);
+            let diag = req.toolchain.clean_diagnostics(&combined, line_offset);
             return Outcome::fail(if diag.is_empty() { "Compilation failed.".into() } else { diag }, Vec::new());
         }
         return Outcome::fail("Compiler produced no object file.", Vec::new());
     }
 
-    let dump_args = ["-M", "gekko", "-drz", &o_file.to_string_lossy()].map(String::from).to_vec();
-    let dump = match run_cmd(&objdump(), &dump_args, Some(&dir), TIMEOUT).await {
+    let (dump_prog, dump_args) = req.toolchain.objdump_cmd(&o_file);
+    let dump_envs: Vec<(&str, String)> = match req.toolchain {
+        Toolchain::Mwcc => Vec::new(),
+        Toolchain::Ido53 => {
+            vec![("LD_LIBRARY_PATH", mips_objdump_lib_dir().to_string_lossy().into_owned())]
+        }
+    };
+    let dump = match run_cmd(&dump_prog, &dump_args, Some(&dir), &dump_envs, TIMEOUT).await {
         Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
         Err(_) => {
             return Outcome::fail(
@@ -455,8 +649,12 @@ fn parse_objdump(text: &str) -> Vec<(String, Vec<Insn>)> {
     static HEADER: OnceLock<Regex> = OnceLock::new();
     static INSN: OnceLock<Regex> = OnceLock::new();
     let header = HEADER.get_or_init(|| Regex::new(r"^[0-9a-fA-F]+\s+<([^>]+)>:").unwrap());
-    // Reloc lines (`R_PPC...`) never match: the disasm bytes group requires hex pairs.
-    let insn = INSN.get_or_init(|| Regex::new(r"^\s*[0-9a-fA-F]+:\s+(?:[0-9a-fA-F]{2}\s){1,4}\s*(.*)$").unwrap());
+    // The bytes column: gekko objdump prints 1-4 hex pairs ("7c 63 22 14 "),
+    // mips objdump one 8-hex word ("27bdffe8 "). Reloc lines (`R_PPC...`,
+    // `R_MIPS...`) never match: their "bytes" column isn't hex.
+    let insn = INSN.get_or_init(|| {
+        Regex::new(r"^\s*[0-9a-fA-F]+:\s+(?:(?:[0-9a-fA-F]{2}\s){1,4}|[0-9a-fA-F]{8}\s)\s*(.*)$").unwrap()
+    });
 
     let mut out: Vec<(String, Vec<Insn>)> = Vec::new();
     for line in text.split('\n') {
@@ -528,12 +726,50 @@ fn clean_diagnostics(text: &str, line_offset: i64) -> String {
     trimmed.chars().take(4000).collect()
 }
 
+/// IDO diagnostics cleanup. cfe reports errors as
+/// `cfe: Error: /scratch/.../u.c, line N: message`, usually followed by a
+/// source-echo line and a caret line (kept — they point at the column). Scrub
+/// the scratch path, remap line numbers past the injected preamble, drop blank
+/// lines, and cap the length like the MWCC scrubber.
+fn clean_ido_diagnostics(text: &str, line_offset: i64) -> String {
+    static IDO_PATH: OnceLock<Regex> = OnceLock::new();
+    static LINENUM: OnceLock<Regex> = OnceLock::new();
+    let ido_path = IDO_PATH.get_or_init(|| Regex::new(r"\S*/u\.c\b").unwrap());
+    let linenum = LINENUM.get_or_init(|| Regex::new(r"\bline (\d+)").unwrap());
+
+    let text = ido_path.replace_all(text, "your code").replace('\r', "");
+
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.split('\n') {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        let remapped = linenum.replacen(raw, 1, |caps: &regex::Captures| {
+            let n: i64 = caps[1].parse().unwrap_or(0);
+            if n > line_offset {
+                format!("line {}", n - line_offset)
+            } else {
+                caps[0].to_string()
+            }
+        });
+        out.push(remapped.into_owned());
+    }
+
+    let joined = out.join("\n");
+    let trimmed = joined.trim();
+    trimmed.chars().take(4000).collect()
+}
+
 /// Compiler banner — handy for /health. Prefixed with the active compiler's label
-/// so each per-version Lambda's /health identifies which build it serves.
-pub async fn compiler_version() -> String {
+/// so each per-version Lambda's /health identifies which build it serves. IDO's
+/// cc has no version flag, so its health is the static label (no subprocess).
+pub async fn compiler_version(toolchain: Toolchain) -> String {
+    if toolchain == Toolchain::Ido53 {
+        return IDO_LABEL.to_string();
+    }
     let label = active_compiler().label;
     let args = vec![mwcc().to_string_lossy().into_owned(), "-version".to_string()];
-    match run_cmd(&wibo(), &args, None, Duration::from_millis(15_000)).await {
+    match run_cmd(&wibo(), &args, None, &[], Duration::from_millis(15_000)).await {
         Ok(out) => {
             let combined = format!(
                 "{}{}",
@@ -664,5 +900,145 @@ mod tests {
         assert!(matches!(Language::parse(Some("c++")), Language::Cpp));
         assert!(matches!(Language::parse(Some("c")), Language::C));
         assert!(matches!(Language::parse(None), Language::C));
+    }
+
+    // ─── IDO 5.3 toolchain ──────────────────────────────────────────────────
+
+    fn req_for(toolchain: Toolchain, opt: &str) -> Request<'static> {
+        Request {
+            code: "",
+            context: None,
+            symbol: "f",
+            language: Language::C,
+            opt: opt.to_string(),
+            peephole: true,
+            schedule: true,
+            extra_flags: Vec::new(),
+            with_types: true,
+            toolchain,
+        }
+    }
+
+    // The MWCC compile command must be byte-identical to the pre-Toolchain
+    // assembly (argv[0] = exe path passed to wibo, then the legacy flag set,
+    // then -c/-o) — or existing reference targets stop matching learners.
+    #[test]
+    fn mwcc_compile_cmd_is_byte_identical_to_legacy() {
+        let req = req_for(Toolchain::Mwcc, DEFAULT_OPT);
+        let (prog, args) =
+            Toolchain::Mwcc.compile_cmd(&req, Path::new("/tmp/x/u.c"), Path::new("/tmp/x/u.o"));
+        assert_eq!(prog, wibo());
+        let mut expected: Vec<String> = vec![mwcc().to_string_lossy().into_owned()];
+        expected.extend(LEGACY_C_FLAGS.iter().map(|s| s.to_string()));
+        expected.extend(["-c", "/tmp/x/u.c", "-o", "/tmp/x/u.o"].map(String::from));
+        assert_eq!(args, expected);
+    }
+
+    // The exact dinosaur-planet game-code invocation (minus -I include and
+    // -DF3DEX_GBI_2): course targets must match the real build's codegen.
+    #[test]
+    fn ido_flags_map_presets() {
+        assert_eq!(
+            ido_base_flags(IDO_DEFAULT_OPT),
+            [
+                "-c", "-D_LANGUAGE_C", "-D_MIPS_SZLONG=32", "-G", "0", "-non_shared",
+                "-Xfullwarn", "-Xcpluscomm", "-Wab,-r4300_mul", "-woff", "838,649,763",
+                "-O2", "-g3", "-mips2",
+            ]
+        );
+        // IDO rejects -O3 with -Xfullwarn; the preset drops the warning flag.
+        let o3 = ido_base_flags("O3");
+        assert!(!o3.contains(&"-Xfullwarn".to_string()));
+        assert!(o3.contains(&"-O3".to_string()));
+        // Comma parts become separate flags.
+        assert!(ido_base_flags("O1,g2").join(" ").contains("-O1 -g2 -mips2"));
+    }
+
+    #[test]
+    fn ido_compile_and_objdump_cmds() {
+        let req = req_for(Toolchain::Ido53, IDO_DEFAULT_OPT);
+        let (prog, args) =
+            Toolchain::Ido53.compile_cmd(&req, Path::new("/tmp/x/u.c"), Path::new("/tmp/x/u.o"));
+        assert_eq!(prog, ido_cc()); // native ELF, no wibo
+        assert_eq!(args[0], "-c");
+        assert!(args.ends_with(&["-o".into(), "/tmp/x/u.o".into(), "/tmp/x/u.c".into()]));
+
+        let (dprog, dargs) = Toolchain::Ido53.objdump_cmd(Path::new("/tmp/x/u.o"));
+        assert_eq!(dprog, mips_objdump());
+        assert_eq!(dargs, ["-m", "mips:4300", "-drz", "/tmp/x/u.o"]);
+        let (gprog, gargs) = Toolchain::Mwcc.objdump_cmd(Path::new("/tmp/x/u.o"));
+        assert_eq!(gprog, objdump());
+        assert_eq!(gargs, ["-M", "gekko", "-drz", "/tmp/x/u.o"]);
+    }
+
+    #[test]
+    fn ido_validate_opt_falls_back() {
+        assert_eq!(Toolchain::Ido53.validate_opt(Some("O1")), "O1");
+        assert_eq!(Toolchain::Ido53.validate_opt(Some("O2,g3")), "O2,g3");
+        // MWCC presets are not IDO presets (and vice versa).
+        assert_eq!(Toolchain::Ido53.validate_opt(Some("O4,p")), IDO_DEFAULT_OPT);
+        assert_eq!(Toolchain::Ido53.validate_opt(None), IDO_DEFAULT_OPT);
+        assert_eq!(Toolchain::Mwcc.validate_opt(Some("O2,g3")), DEFAULT_OPT);
+        assert_eq!(Toolchain::Mwcc.validate_opt(Some("O4,p")), "O4,p");
+    }
+
+    #[test]
+    fn ido_is_c_only_and_has_its_own_scratch_root() {
+        assert_eq!(Toolchain::Ido53.source_ext(Language::Cpp), "c");
+        assert_eq!(Toolchain::Mwcc.source_ext(Language::Cpp), "cpp");
+        assert_ne!(Toolchain::Ido53.scratch_root(), Toolchain::Mwcc.scratch_root());
+    }
+
+    // Real output captured from powerpc-eabi-objdump -M gekko -drz (MWCC GC/2.0
+    // object): the bytes column is hex PAIRS, relocs indented with tabs.
+    const GEKKO_DUMP: &str = "00000000 <addmul>:\n   0:\t7c 03 21 d6 \tmullw   r0,r3,r4\n   4:\t80 60 00 00 \tlwz     r3,0(0)\n\t\t\t4: R_PPC_EMB_SDA21\tgCount\n   8:\t7c 63 02 14 \tadd     r3,r3,r0\n   c:\t4e 80 00 20 \tblr\n";
+
+    // Real output captured from mips objdump -m mips:4300 -drz (IDO 5.3 object):
+    // the bytes column is ONE 8-hex word, and operands are tab-separated.
+    const MIPS_DUMP: &str = "00000000 <addmul>:\n   0:\t00850019 \tmultu\ta0,a1\n   4:\t3c0f0000 \tlui\tt7,0x0\n\t\t\t4: R_MIPS_HI16\tgCount\n   8:\t8def0000 \tlw\tt7,0(t7)\n\t\t\t8: R_MIPS_LO16\tgCount\n   c:\t00007012 \tmflo\tt6\n  10:\t01cf1021 \taddu\tv0,t6,t7\n  14:\t00000000 \tnop\n  18:\t03e00008 \tjr\tra\n  1c:\t00000000 \tnop\n";
+
+    #[test]
+    fn parse_objdump_handles_gekko_byte_pairs() {
+        let funcs = parse_objdump(GEKKO_DUMP);
+        assert_eq!(funcs.len(), 1);
+        let (name, insns) = &funcs[0];
+        assert_eq!(name, "addmul");
+        let mn: Vec<&str> = insns.iter().map(|i| i.mnemonic.as_str()).collect();
+        assert_eq!(mn, ["mullw", "lwz", "add", "blr"], "reloc line must be skipped");
+        assert_eq!(insns[0].raw_operands, "r0,r3,r4");
+    }
+
+    #[test]
+    fn parse_objdump_handles_mips_word_column() {
+        let funcs = parse_objdump(MIPS_DUMP);
+        assert_eq!(funcs.len(), 1);
+        let (name, insns) = &funcs[0];
+        assert_eq!(name, "addmul");
+        let mn: Vec<&str> = insns.iter().map(|i| i.mnemonic.as_str()).collect();
+        assert_eq!(
+            mn,
+            ["multu", "lui", "lw", "mflo", "addu", "nop", "jr", "nop"],
+            "both reloc lines must be skipped"
+        );
+        assert_eq!(insns[0].raw_operands, "a0,a1");
+        assert_eq!(insns[5].raw_operands, "", "nop has no operands");
+        assert_eq!(insns[6].raw_operands, "ra");
+    }
+
+    // Real cfe error shape captured from IDO 5.3 (scratch path shortened): the
+    // path is scrubbed, the line number remapped past the injected preamble,
+    // and the source-echo + caret lines kept.
+    #[test]
+    fn ido_diagnostics_scrub_and_remap() {
+        let raw = "cfe: Error: /tmp/ido/123-9-0/u.c, line 29: Syntax Error\n s32 g(void) { return \"x\" + ; }\n ---------------------------^\n";
+        assert_eq!(
+            clean_ido_diagnostics(raw, 27),
+            "cfe: Error: your code, line 2: Syntax Error\n s32 g(void) { return \"x\" + ; }\n ---------------------------^"
+        );
+        // Numbers at/below the preamble boundary stay untouched.
+        assert_eq!(
+            clean_ido_diagnostics("cfe: Error: /x/u.c, line 5: bad\n", 27),
+            "cfe: Error: your code, line 5: bad"
+        );
     }
 }

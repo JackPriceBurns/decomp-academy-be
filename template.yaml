@@ -2,10 +2,10 @@ AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 Description: >
   Decomp Academy API. A fully serverless stack behind the custom domain: the
-  MWCC GC/2.0 compile service (x86_64 Lambda running wibo) and the auth + user-data
-  API (Cognito, HTTP API, Lambda, DynamoDB), all on one HTTP API. The frontend
-  reaches the compiler via the original flat routes and the versioned
-  /compile/mwcc/{version}/{action} routes.
+  compile service (x86_64 Lambdas — MWCC under wibo, IDO 5.3 native) and the
+  auth + user-data API (Cognito, HTTP API, Lambda, DynamoDB), all on one HTTP
+  API. The frontend reaches the compilers via the original flat routes, the
+  versioned /compile/mwcc/{version}/{action} routes, and /compile/ido/5.3/{action}.
 
 Parameters:
   DomainName:
@@ -286,6 +286,10 @@ Resources:
           ThrottlingBurstLimit: 10
           ThrottlingRateLimit: 5
         "POST /compile/mwcc/43_213/compile":
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+        # The IDO Lambda's playground route (same limits as the mwcc ones).
+        "POST /compile/ido/5.3/compile":
           ThrottlingBurstLimit: 10
           ThrottlingRateLimit: 5
         # /stats/{lessonId} is public so anonymous learners' compiles still count;
@@ -1590,14 +1594,58 @@ Resources:
           Type: HttpApi
           Properties: { ApiId: !Ref HttpApi, Path: /compile/mwcc/43_213/compile, Method: POST, Auth: { Authorizer: NONE } }
 
+  # ─── IDO 5.3 (N64 / MIPS, decompals/ido-static-recomp) ──────────────────────
+  # Same shared bootstrap + vendored set as the MWCC Lambdas; the route family
+  # (/compile/ido/5.3/*) selects the toolchain in the router, so no env-based
+  # version selection is needed. TOOLCHAIN is informational (logs/console) only.
+  CompileFnIdo53:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: compiler/
+      Handler: bootstrap
+      Runtime: provided.al2023
+      Architectures:
+        - x86_64
+      Timeout: 30
+      MemorySize: 2048
+      EphemeralStorage:
+        Size: 2048
+      Environment:
+        Variables:
+          TOOLCHAIN: ido_53
+      Policies:
+        - AWSLambdaVPCAccessExecutionRole
+      VpcConfig:
+        SubnetIds:
+          - !Ref CompileSubnetA
+          - !Ref CompileSubnetB
+        SecurityGroupIds:
+          - !Ref CompileNoEgressSg
+      Events:
+        Health:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/ido/5.3/health, Method: GET, Auth: { Authorizer: NONE } }
+        Target:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/ido/5.3/target, Method: POST, Auth: { Authorizer: NONE } }
+        Check:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/ido/5.3/check, Method: POST, Auth: { Authorizer: NONE } }
+        Compile:
+          Type: HttpApi
+          Properties: { ApiId: !Ref HttpApi, Path: /compile/ido/5.3/compile, Method: POST, Auth: { Authorizer: NONE } }
+
 Outputs:
   ApiUrl:
     Description: Public base URL of the serverless API.
     Value: !Sub "https://${DomainName}"
   CompileApiUrl:
     Description: >
-      MWCC compile service on Lambda, behind the custom domain: flat /health,
-      /target, /check, /compile and versioned /compile/mwcc/{version}/{action}.
+      Compile service on Lambda, behind the custom domain: flat /health,
+      /target, /check, /compile, versioned /compile/mwcc/{version}/{action},
+      and /compile/ido/5.3/{action}.
     Value: !Sub "https://${DomainName}"
   HttpApiEndpoint:
     Description: Raw execute-api endpoint (before the custom domain).

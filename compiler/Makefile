@@ -23,8 +23,10 @@ fetch-toolchain:
 
 # CARGO_TARGET_DIR (set in CI to a stable path outside SAM's per-build scratch dir)
 # lets the compiled-dependency cache survive across runs; falls back to ./target
-# for a plain local `sam build`. Only wibo + objdump are native ELF needing +x;
-# the mwcceppc.exe / .dll files are read by wibo, never exec'd by the kernel.
+# for a plain local `sam build`. Native ELFs needing +x: wibo, both objdumps, and
+# the IDO 5.3 pass binaries (the blanket chmod on ido/5.3/* also touches its
+# .o/.so data files, which is harmless); the mwcceppc.exe / .dll files are read
+# by wibo, never exec'd by the kernel.
 build-%: fetch-toolchain
 	cargo build --release --target $(TARGET)
 	cp $${CARGO_TARGET_DIR:-target}/$(TARGET)/release/bootstrap $(ARTIFACTS_DIR)/bootstrap
@@ -32,3 +34,5 @@ build-%: fetch-toolchain
 	cp -r vendor/. $(ARTIFACTS_DIR)/vendor/
 	chmod +x $(ARTIFACTS_DIR)/vendor/toolchain/wibo
 	chmod +x $(ARTIFACTS_DIR)/vendor/toolchain/binutils/powerpc-eabi-objdump
+	chmod +x $(ARTIFACTS_DIR)/vendor/toolchain/binutils-mips/mips-ps2-decompals-objdump
+	chmod +x $(ARTIFACTS_DIR)/vendor/ido/5.3/*

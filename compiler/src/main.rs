@@ -1,9 +1,11 @@
-// AWS Lambda (HTTP API, payload format 2.0) entry point for the MWCC GC/2.0
-// compile service, on the `provided.al2023` custom runtime. The vendored
-// toolchain ships under vendor/ inside the deployment package and runs in place
-// from $LAMBDA_TASK_ROOT (the Makefile marks the binaries executable at build
-// time) — no copying to /tmp on cold start. wibo self-detects Lambda's
-// seccomp-blocked set_thread_area and falls back to modify_ldt (decompals/wibo#130).
+// AWS Lambda (HTTP API, payload format 2.0) entry point for the compile
+// service — MWCC (PowerPC, under wibo) on /compile/mwcc/{version}/* plus the
+// legacy flat routes, and IDO 5.3 (MIPS, native ELF) on /compile/ido/5.3/* —
+// on the `provided.al2023` custom runtime. The vendored toolchains ship under
+// vendor/ inside the deployment package and run in place from $LAMBDA_TASK_ROOT
+// (the Makefile marks the binaries executable at build time) — no copying to
+// /tmp on cold start. wibo self-detects Lambda's seccomp-blocked
+// set_thread_area and falls back to modify_ldt (decompals/wibo#130).
 
 mod compile;
 
@@ -21,10 +23,13 @@ struct CompileBody {
     symbol: Option<String>,
     context: Option<String>,
     /// "c" (default) or "cpp" — selects -lang and the source file extension.
+    /// MWCC-only: the IDO routes are C-only and ignore this field.
     language: Option<String>,
-    /// Optimization preset, validated against compile::ALLOWED_OPT (default "O4,p").
+    /// Optimization preset, validated per toolchain (MWCC: compile::ALLOWED_OPT,
+    /// default "O4,p"; IDO: compile::IDO_ALLOWED_OPT, default "O2,g3").
     opt: Option<String>,
     /// Disable the peephole / instruction-scheduling passes (default: enabled).
+    /// MWCC-only: ignored on the IDO routes (IDO has no such toggles).
     peephole: Option<bool>,
     schedule: Option<bool>,
     /// Compiler version id; only "GC/2.0" is supported today.
@@ -39,11 +44,12 @@ struct CompileBody {
     // above; any unknown JSON fields (incl. a stray "extraFlags") are ignored.
 }
 
-/// Shared codegen knobs derived from a request body, with today's defaults.
-fn opt_fields(body: &CompileBody) -> (compile::Language, String, bool, bool) {
+/// Shared codegen knobs derived from a request body, with that toolchain's
+/// defaults (opt validation is per-toolchain; the rest only matter for MWCC).
+fn opt_fields(toolchain: compile::Toolchain, body: &CompileBody) -> (compile::Language, String, bool, bool) {
     (
         compile::Language::parse(body.language.as_deref()),
-        compile::validate_opt(body.opt.as_deref()),
+        toolchain.validate_opt(body.opt.as_deref()),
         body.peephole.unwrap_or(true),
         body.schedule.unwrap_or(true),
     )
@@ -52,7 +58,8 @@ fn opt_fields(body: &CompileBody) -> (compile::Language, String, bool, bool) {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     match std::env::args().nth(1).as_deref() {
-        Some("selftest") => return selftest().await,
+        Some("selftest") => return selftest(compile::Toolchain::Mwcc).await,
+        Some("selftest-ido") => return selftest(compile::Toolchain::Ido53).await,
         Some("leaktest") => {
             let n = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(200usize);
             return leaktest(n).await;
@@ -111,6 +118,7 @@ async fn leaktest(iters: usize) -> Result<(), Error> {
             schedule: true,
             extra_flags: Vec::new(),
             with_types: true,
+            toolchain: compile::Toolchain::Mwcc,
         })
         .await;
         if (i + 1) % 20 == 0 {
@@ -151,54 +159,82 @@ fn parse_body(raw: &[u8]) -> Option<CompileBody> {
     Some(serde_json::from_slice(raw).unwrap_or_default())
 }
 
-// Two route families reach the same three handlers:
+// Three route families reach the same three handlers:
 //   * the original flat routes — `POST /target|/check|/compile`, `GET /health`
-//   * the versioned structure — `/compile/mwcc/{version}/{action}` — added so the
-//     frontend can pick a compiler/version per lesson and we can host more
-//     versions (and, later, more compilers) behind one URL shape. The flat routes
+//   * the versioned MWCC structure — `/compile/mwcc/{version}/{action}` — added
+//     so the frontend can pick a compiler/version per lesson. The flat routes
 //     stay live and byte-identical so deploying this can't break the frontend.
+//   * the IDO family — `/compile/ido/5.3/{action}` — same handlers running the
+//     IDO 5.3 toolchain (N64/MIPS course).
 // On the versioned routes the URL is authoritative for compiler/version; the
-// body `compiler` field is ignored (the path already says `mwcc`).
+// body `compiler` field is ignored (the path already names the compiler).
 async fn route(method: &str, path: &str, raw: &[u8]) -> Response<Body> {
+    use RouteSel::{Flat, Ido53, MwccVersion};
     let segs: Vec<&str> = path.trim_matches('/').split('/').filter(|s| !s.is_empty()).collect();
     match (method, segs.as_slice()) {
-        ("GET", ["health"]) | ("GET", []) => handle_health().await,
+        ("GET", ["health"]) | ("GET", []) => handle_health(compile::Toolchain::Mwcc).await,
         ("GET", ["compile", "mwcc", version, "health"]) => match validate_path_version(version) {
-            Ok(()) => handle_health().await,
+            Ok(()) => handle_health(compile::Toolchain::Mwcc).await,
             Err(r) => r,
         },
+        ("GET", ["compile", "ido", "5.3", "health"]) => handle_health(compile::Toolchain::Ido53).await,
 
-        ("POST", ["target"]) => with_body(raw, None, handle_target).await,
-        ("POST", ["check"]) => with_body(raw, None, handle_check).await,
-        ("POST", ["compile"]) => with_body(raw, None, handle_compile).await,
+        ("POST", ["target"]) => with_body(raw, Flat, handle_target).await,
+        ("POST", ["check"]) => with_body(raw, Flat, handle_check).await,
+        ("POST", ["compile"]) => with_body(raw, Flat, handle_compile).await,
 
-        ("POST", ["compile", "mwcc", version, "target"]) => with_body(raw, Some(version), handle_target).await,
-        ("POST", ["compile", "mwcc", version, "check"]) => with_body(raw, Some(version), handle_check).await,
-        ("POST", ["compile", "mwcc", version, "compile"]) => with_body(raw, Some(version), handle_compile).await,
+        ("POST", ["compile", "mwcc", version, "target"]) => with_body(raw, MwccVersion(version), handle_target).await,
+        ("POST", ["compile", "mwcc", version, "check"]) => with_body(raw, MwccVersion(version), handle_check).await,
+        ("POST", ["compile", "mwcc", version, "compile"]) => with_body(raw, MwccVersion(version), handle_compile).await,
+
+        // The IDO version is a literal: any other /compile/ido/... path 404s
+        // below (a new IDO build would be a new literal + Lambda, like MWCC).
+        ("POST", ["compile", "ido", "5.3", "target"]) => with_body(raw, Ido53, handle_target).await,
+        ("POST", ["compile", "ido", "5.3", "check"]) => with_body(raw, Ido53, handle_check).await,
+        ("POST", ["compile", "ido", "5.3", "compile"]) => with_body(raw, Ido53, handle_compile).await,
 
         _ => json_resp(404, json!({ "ok": false, "error": format!("No route for {method} {path}.") })),
     }
 }
 
-/// Parse + validate a request body, then run `handler`. `url_version` is `Some`
-/// for the versioned routes (validate the path token, ignore body `compiler`) and
-/// `None` for the flat routes (validate the body `compiler` field, as before).
-async fn with_body<F, Fut>(raw: &[u8], url_version: Option<&str>, handler: F) -> Response<Body>
+/// Which route family matched, and therefore how to validate the request and
+/// which toolchain the handler runs.
+enum RouteSel<'a> {
+    /// Legacy flat routes: validate the body's `compiler` field, run MWCC.
+    Flat,
+    /// /compile/mwcc/{version}/*: validate the path token, run MWCC.
+    MwccVersion(&'a str),
+    /// /compile/ido/5.3/*: the literal path is the validation, run IDO.
+    Ido53,
+}
+
+impl RouteSel<'_> {
+    fn toolchain(&self) -> compile::Toolchain {
+        match self {
+            RouteSel::Ido53 => compile::Toolchain::Ido53,
+            _ => compile::Toolchain::Mwcc,
+        }
+    }
+}
+
+/// Parse + validate a request body, then run `handler` with the route's toolchain.
+async fn with_body<F, Fut>(raw: &[u8], sel: RouteSel<'_>, handler: F) -> Response<Body>
 where
-    F: FnOnce(CompileBody) -> Fut,
+    F: FnOnce(compile::Toolchain, CompileBody) -> Fut,
     Fut: std::future::Future<Output = Response<Body>>,
 {
     let Some(body) = parse_body(raw) else {
         return json_resp(413, json!({ "ok": false, "error": "Body too large or unreadable." }));
     };
-    let validation = match url_version {
-        Some(v) => compile::validate_version(v),
-        None => compile::validate_compiler(body.compiler.as_deref()),
+    let validation = match &sel {
+        RouteSel::MwccVersion(v) => compile::validate_version(v),
+        RouteSel::Flat => compile::validate_compiler(body.compiler.as_deref()),
+        RouteSel::Ido53 => Ok(()),
     };
     if let Err(e) = validation {
         return json_resp(200, json!({ "ok": false, "error": e }));
     }
-    handler(body).await
+    handler(sel.toolchain(), body).await
 }
 
 /// `GET /compile/mwcc/{version}/health` has no body to thread through `with_body`.
@@ -206,17 +242,17 @@ fn validate_path_version(v: &str) -> Result<(), Response<Body>> {
     compile::validate_version(v).map_err(|e| json_resp(200, json!({ "ok": false, "error": e })))
 }
 
-async fn handle_health() -> Response<Body> {
-    json_resp(200, json!({ "ok": true, "version": compile::compiler_version().await }))
+async fn handle_health(toolchain: compile::Toolchain) -> Response<Body> {
+    json_resp(200, json!({ "ok": true, "version": compile::compiler_version(toolchain).await }))
 }
 
-async fn handle_target(body: CompileBody) -> Response<Body> {
+async fn handle_target(toolchain: compile::Toolchain, body: CompileBody) -> Response<Body> {
     let solution = body.solution.as_deref();
     let symbol = body.symbol.as_deref().filter(|s| !s.is_empty());
     let (Some(solution), Some(symbol)) = (solution, symbol) else {
         return json_resp(400, json!({ "ok": false, "error": "target requires { solution, symbol }." }));
     };
-    let (language, opt, peephole, schedule) = opt_fields(&body);
+    let (language, opt, peephole, schedule) = opt_fields(toolchain, &body);
     let out = compile::compile(compile::Request {
         code: solution,
         context: body.context.as_deref(),
@@ -227,6 +263,7 @@ async fn handle_target(body: CompileBody) -> Response<Body> {
         schedule,
         extra_flags: Vec::new(), // caller flags are never trusted (see CompileBody)
         with_types: body.with_types.unwrap_or(true),
+        toolchain,
     })
     .await;
     if out.ok {
@@ -236,7 +273,7 @@ async fn handle_target(body: CompileBody) -> Response<Body> {
     }
 }
 
-async fn handle_check(body: CompileBody) -> Response<Body> {
+async fn handle_check(toolchain: compile::Toolchain, body: CompileBody) -> Response<Body> {
     let code = body.code.as_deref();
     let symbol = body.symbol.as_deref().filter(|s| !s.is_empty());
     let (Some(code), Some(symbol)) = (code, symbol) else {
@@ -245,7 +282,7 @@ async fn handle_check(body: CompileBody) -> Response<Body> {
     if code.len() > MAX_CODE {
         return json_resp(413, json!({ "ok": false, "error": "Code too long." }));
     }
-    let (language, opt, peephole, schedule) = opt_fields(&body);
+    let (language, opt, peephole, schedule) = opt_fields(toolchain, &body);
     let out = compile::compile(compile::Request {
         code,
         context: body.context.as_deref(),
@@ -256,6 +293,7 @@ async fn handle_check(body: CompileBody) -> Response<Body> {
         schedule,
         extra_flags: Vec::new(), // caller flags are never trusted (see CompileBody)
         with_types: body.with_types.unwrap_or(true),
+        toolchain,
     })
     .await;
     if out.ok {
@@ -265,14 +303,14 @@ async fn handle_check(body: CompileBody) -> Response<Body> {
     }
 }
 
-async fn handle_compile(body: CompileBody) -> Response<Body> {
+async fn handle_compile(toolchain: compile::Toolchain, body: CompileBody) -> Response<Body> {
     let Some(code) = body.code.as_deref() else {
         return json_resp(400, json!({ "ok": false, "error": "compile requires { code }." }));
     };
     if code.len() > MAX_CODE {
         return json_resp(413, json!({ "ok": false, "error": "Code too long." }));
     }
-    let (language, opt, peephole, schedule) = opt_fields(&body);
+    let (language, opt, peephole, schedule) = opt_fields(toolchain, &body);
     // Free-form playground compile: no lesson, no fixed symbol. An empty
     // symbol tells compile() to return the object + every function symbol;
     // the browser disassembles + picks a function with objdiff.
@@ -286,6 +324,7 @@ async fn handle_compile(body: CompileBody) -> Response<Body> {
         schedule,
         extra_flags: Vec::new(), // caller flags are never trusted (see CompileBody)
         with_types: body.with_types.unwrap_or(true),
+        toolchain,
     })
     .await;
     if out.ok {
@@ -295,19 +334,21 @@ async fn handle_compile(body: CompileBody) -> Response<Body> {
     }
 }
 
-/// Local validation: `bootstrap selftest` compiles a trivial function against the
-/// toolchain pointed at by WIBO/MWCC/OBJDUMP and prints the outcome as JSON.
-async fn selftest() -> Result<(), Error> {
+/// Local validation: `bootstrap selftest` (MWCC, via WIBO/MWCC/OBJDUMP env
+/// overrides) or `bootstrap selftest-ido` (IDO 5.3, via IDO_CC/MIPS_OBJDUMP)
+/// compiles a trivial function and prints the outcome as JSON.
+async fn selftest(toolchain: compile::Toolchain) -> Result<(), Error> {
     let out = compile::compile(compile::Request {
         code: "int add(int a, int b){ return a + b; }",
         context: None,
         symbol: "add",
         language: compile::Language::C,
-        opt: compile::DEFAULT_OPT.to_string(),
+        opt: toolchain.validate_opt(None),
         peephole: true,
         schedule: true,
         extra_flags: Vec::new(),
         with_types: true,
+        toolchain,
     })
     .await;
     println!(
@@ -340,11 +381,29 @@ mod compat_tests {
         let body: CompileBody = serde_json::from_str(legacy).expect("legacy body parses");
 
         assert!(compile::validate_compiler(body.compiler.as_deref()).is_ok());
-        let (language, opt, peephole, schedule) = opt_fields(&body);
+        let (language, opt, peephole, schedule) = opt_fields(compile::Toolchain::Mwcc, &body);
         assert!(matches!(language, compile::Language::C));
         assert_eq!(opt, "O4,p");
         assert!(peephole);
         assert!(schedule);
+    }
+
+    // The same body on the IDO route resolves to IDO defaults — and an MWCC
+    // preset in `opt` falls back rather than leaking across toolchains.
+    #[test]
+    fn ido_opt_fields_use_ido_defaults() {
+        let body: CompileBody =
+            serde_json::from_str(r#"{"code":"x","symbol":"f"}"#).expect("parses");
+        let (_, opt, _, _) = opt_fields(compile::Toolchain::Ido53, &body);
+        assert_eq!(opt, "O2,g3");
+        let body: CompileBody =
+            serde_json::from_str(r#"{"code":"x","symbol":"f","opt":"O4,p"}"#).expect("parses");
+        let (_, opt, _, _) = opt_fields(compile::Toolchain::Ido53, &body);
+        assert_eq!(opt, "O2,g3");
+        let body: CompileBody =
+            serde_json::from_str(r#"{"code":"x","symbol":"f","opt":"O1"}"#).expect("parses");
+        let (_, opt, _, _) = opt_fields(compile::Toolchain::Ido53, &body);
+        assert_eq!(opt, "O1");
     }
 
     // Unknown future fields must not break parsing either (serde ignores them).
@@ -393,12 +452,48 @@ mod compat_tests {
         assert!(body_string(resp).contains("Unsupported mwcc version"));
     }
 
-    // This Lambda's routes are mwcc-only; any other compiler segment falls through
-    // to a 404 (a different compiler would be a different function/integration).
+    // Unknown compiler segments fall through to 404 (a different compiler would
+    // be a different route family/Lambda, like ido below).
     #[tokio::test]
     async fn unknown_compiler_and_paths_404() {
         assert_eq!(route("POST", "/compile/other/1.0/check", b"{}").await.status(), 404);
         assert_eq!(route("GET", "/nope", b"").await.status(), 404);
+    }
+
+    // The IDO family reaches the same three handlers (empty body 400s before
+    // any compiler is invoked, proving the route landed), its version segment
+    // is a literal (anything else 404s), and its health needs no toolchain
+    // probe (safe to assert the body in plain CI).
+    #[tokio::test]
+    async fn ido_routes_reach_handlers() {
+        assert_eq!(route("POST", "/compile/ido/5.3/check", b"{}").await.status(), 400);
+        assert_eq!(route("POST", "/compile/ido/5.3/target", b"{}").await.status(), 400);
+        assert_eq!(route("POST", "/compile/ido/5.3/compile", b"{}").await.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn ido_version_segment_is_literal() {
+        assert_eq!(route("POST", "/compile/ido/9.9/check", b"{}").await.status(), 404);
+        assert_eq!(route("POST", "/compile/ido/5.3.1/check", b"{}").await.status(), 404);
+        assert_eq!(route("GET", "/compile/ido/9.9/health", b"").await.status(), 404);
+    }
+
+    #[tokio::test]
+    async fn ido_health_reports_static_label() {
+        let resp = route("GET", "/compile/ido/5.3/health", b"").await;
+        assert_eq!(resp.status(), 200);
+        let body = body_string(resp);
+        assert!(body.contains("\"ok\":true"), "got: {body}");
+        assert!(body.contains("IDO 5.3"), "got: {body}");
+    }
+
+    // The body `compiler` field is ignored on the ido routes (URL authoritative),
+    // like the versioned mwcc routes: it still 400s on missing fields rather
+    // than erroring on the compiler name.
+    #[tokio::test]
+    async fn ido_route_ignores_body_compiler_field() {
+        let resp = route("POST", "/compile/ido/5.3/check", br#"{"compiler":"GC/2.0"}"#).await;
+        assert_eq!(resp.status(), 400);
     }
 
     #[tokio::test]

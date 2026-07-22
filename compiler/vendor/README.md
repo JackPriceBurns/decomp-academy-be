@@ -8,6 +8,9 @@ The compile service runs native binaries from this `vendor/` tree, in place from
 |---|---|---|---|---|
 | `compiler/<family>/<dir>/mwcceppc.exe` + `lmgr*.dll` | Metrowerks CodeWarrior PE32 — one dir per row in [`compilers.list`](../compilers.list) (GC MW 1.0 … Wii MW 1.7) | [files.decomp.dev](https://files.decomp.dev) compilers bundle | `20251118` | **fetched** |
 | `toolchain/binutils/powerpc-eabi-objdump` | gekko-patched objdump (static ELF) | [encounter/gc-wii-binutils](https://github.com/encounter/gc-wii-binutils) `linux-x86_64.zip` | `2.42-1` | **fetched** |
+| `ido/5.3/*` | SGI IDO 5.3 `cc` driver + compiler passes (cfe/uopt/ugen/as1…), statically recompiled to native x86_64 ELF (N64/MIPS course) | [decompals/ido-static-recomp](https://github.com/decompals/ido-static-recomp) `ido-5.3-recomp-linux.tar.gz` | `v1.2` | **fetched** |
+| `toolchain/binutils-mips/mips-ps2-decompals-objdump` | mips objdump (binutils 2.40; v0.4 is the newest release that runs on AL2023's glibc 2.34) | [decompals/binutils-mips-ps2-decompals](https://github.com/decompals/binutils-mips-ps2-decompals) `linux-x86-64.tar.gz` | `v0.4` | **fetched** |
+| `toolchain/binutils-mips/lib/libzstd.so.1` | the mips objdump's one shared-lib dep (BSD); vendored because the Lambda runtime may not ship zstd — the service sets `LD_LIBRARY_PATH` for the objdump call | Debian bullseye `libzstd1_1.4.8+dfsg-2.1_amd64.deb` via content-addressed [snapshot.debian.org](https://snapshot.debian.org) | `1.4.8` | **fetched** |
 | `toolchain/wibo` | Win32 loader (Linux x86_64, static ELF) | [decompals/wibo](https://github.com/decompals/wibo) `static-release64` CI artifact | `main` @ `cd743b0` (incl. [#130](https://github.com/decompals/wibo/pull/130)) | **committed** |
 
 Every supported MWCC version is vendored at `compiler/<family>/<dir>/` (mirroring
